@@ -1,4 +1,4 @@
-/* Copyright (c) 2022, Edwin Freekenhorst and Henk Stegeman
+/* Copyright (c) 2023, Edwin Freekenhorst and Henk Stegeman
 
    Permission is hereby granted, free of charge, to any person obtaining a
    copy of this software and associated documentation files (the "Software"),
@@ -19,7 +19,7 @@
    DEALINGS IN THE SOFTWARE.
    ---------------------------------------------------------------------------
 
-   i327x_3274.c - (C) Copyright 2021 by Edwin Freekenhorst and Henk Stegeman
+   i3274_cc.c - (C) Copyright 2021 by Edwin Freekenhorst and Henk Stegeman
 
    This module simulates an IBM 3274 cluster controller, including
    SNA/SDLC protocol.
@@ -59,6 +59,14 @@
 
 #define BUFPD 0x1C
 
+/* RS232 signals. The 4 high order bit positions are alinged with the scanner Display Register   */
+#define CTS 0x80   /* Clear To Send                 */
+#define RI  0x40   /* Ring Indicator                */
+#define DSR 0x20   /* Data Set Ready                */
+#define DCD 0x10   /* Data Carrier Detect           */
+#define RTS 0x08   /* Request To Send               */
+#define DTR 0x04   /* Data Terminal Ready           */
+
 uint16_t Tdbg_flag = OFF;           /* 1 when Ttrace.log open */
 FILE *T_trace;                      /* Terminal trace file fd */
 
@@ -68,13 +76,15 @@ struct epoll_event event, events[MAXSNAPU*2];
 struct ifaddrs *nwaddr, *ifa;       /* interface address structure       */
 in_addr_t  lineip;                  /* SDLC line listening address       */
 uint16_t   lineport;                /* SDLC line listening port          */
-int        pusdlc_fd;
+int        pusdlc_fd;               /* PU.T2 connection                  */
+int        rs232_fd;                /* RS232 signal connection           */
 int        station;                 /* Station number based on station address */
 int        sockopt;                 /* Used for setsocketoption          */
 int        pendingrcv;              /* pending data on the socket        */
 int        event_count;             /* # events received                 */
 char       *ipaddr;
 BYTE       bfr[256];
+uint8_t    rs232_stat;              /* RS232 signal status               */
 
 // Host ---> PU request buffer
 uint8_t BLU_req_buf[BUFLEN_3274];   // DLC header + TH + RH + RU + DLC trailer
@@ -107,6 +117,7 @@ int connect_client (int *csockp, BYTE i327xnump, BYTE *lunump, BYTE *lunumr);
 int SocketReadAct (int fd);
 
 void make_seq (struct CB327x *pu2, BYTE *bufptr, int lunum);
+void ReadSig (int rs232_fd);
 
 /*-------------------------------------------------------------------*/
 /* Supported FMD NS Headers                                          */
@@ -1111,13 +1122,24 @@ void main(int argc, char *argv[]) {
    int SDLCrsptl = 0;               /* Total size of response frames  */
    int FptrI = 0;
    int pendingrcv;                  /* pending data on the socket     */
-   int linenum = 20;                /* SDLC line number (default 20)     */
+   int linenum = 20;                /* SDLC line number (default 20)  */
    int Fptr,FptrL, frame_len;       /* SDLC frame pointers and lenght */
    int i, rc;
    int Fptr2[16] = {0};
    char ipv4addr[sizeof(struct in_addr)];
+   uint8_t signal;                  /* RS232 signal                   */
 
    //pthread_t thread;
+   /* Read command line arguments */
+   if (argc == 1) {
+      printf("PU2: Error - Arguments missing\n\r");
+      printf("\r Valid arguments are:\n");
+      printf("\r  -cchn {hostname}    : hostname of host running the 3705\n");
+      printf("\r  -ccip {ipaddress}   : ipaddress of host running the 3705 \n");
+      printf("\r  -line {line number} : SDLC line number to connect to\n");
+      printf("\r  -d : switch debug on  \n");
+   return;
+   }
    Tdbg_flag = OFF;
    i = 1;
    while (i < argc) {
@@ -1126,9 +1148,35 @@ void main(int argc, char *argv[]) {
          printf("\rPU2: Debug on. Trace file is trace_3274.log\n");
          i++;
          continue;
+      } else if (strcmp(argv[i], "-cchn") == 0) {
+         if ( (lineent = gethostbyname(argv[i+1]) ) == NULL ) {
+            printf("\rPU2: Cannot resolve hostname %s\n", argv[i+1]);
+            return; /* error */
+         }  // End if lineent
+         printf("\rPU2: Connection to be established with 3705 SDLC line at host %s\n", argv[i+1]);
+         i = i + 2;
+         continue;
+      } else if (strcmp(argv[i], "-ccip") == 0) {
+         inet_pton(AF_INET, argv[i+1], ipv4addr);
+         if ( (lineent = gethostbyaddr(&ipv4addr,sizeof(ipv4addr),AF_INET) ) == NULL ) {
+            printf("\rPU2: Cannot resolve ip address %s\n", argv[i+1]);
+            return; /* error */
+         }  // End if lineent
+         printf("\rPU2: Connection to be established with 3705 SDLC line at ip address %s\n", argv[i+1]);
+         i = i + 2;
+         continue;
+      } else if (strcmp(argv[i], "-line") == 0) {
+         sscanf(argv[i+1], "%d", &linenum);
+         printf("\rPU2: Connection to be established with SDLC line %d\n", linenum);
+         i = i + 2;
+         continue;
       } else {
          printf("\rPU2: invalid argument %s\n",argv[i]);
-         printf("\r      -d : switch debug on  \n");
+         printf("\r   Valid arguments are:\n");
+         printf("\r    -cchn {hostname}    : hostname of host running the 3705\n");
+         printf("\r    -ccip {ipaddress}   : ipaddress of host running the 3705 \n");
+         printf("\r    -line {line number} : SDLC line number to connect to\n");
+         printf("\r    -d : switch debug on  \n");
          return;
       }  // End else
    }  // End while
@@ -1138,151 +1186,220 @@ void main(int argc, char *argv[]) {
    // ********************************************************************
    if (Tdbg_flag == ON) {
       T_trace = fopen("trace_3274.log", "w");
-      fprintf(T_trace, "     ****** 3174 Terminal Controller log file ****** \n\n"
-                       "     i327x_3174 -d : trace all 3174 activities\n"
+      fprintf(T_trace, "     ****** 3274 Terminal Controller log file ****** \n\n"
+                       "     i327x_3274 -d : trace all 3274 activities\n"
                        );
    }
+   // SDLC line socket creation
+   pusdlc_fd = socket(AF_INET, SOCK_STREAM, 0);
+   if (pusdlc_fd <= 0) {
+      printf("\rPU2: Cannot create line socket\n");
+      return;
+   }
+   // RS232 socket creation
+   rs232_fd = socket(AF_INET, SOCK_STREAM, 0);
+   if (rs232_fd <= 0) {
+      printf("\rPU2: Cannot create RS232 socket\n");
+      return;
+   }
+   // Assign IP addr and PORT number
+   servaddr.sin_family = AF_INET;
+   memcpy(&servaddr.sin_addr, lineent->h_addr_list[0], lineent->h_length);
+   // servaddr.sin_addr.s_addr = lineip;
+   servaddr.sin_port = htons(SDLCLBASE+linenum);
+   // Connect to the SDLC line socket
+   printf("\rPU2: Waiting for SDLC line %d connection to be established\n",linenum);
+   while (connect(pusdlc_fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) != 0) {
+      sleep(1);
+   }
+   while (connect(rs232_fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) != 0) {
+      sleep(1);
+   }
+   printf("\rPU2: SDLC line %d connection has been established\n",linenum);
    // Now 'IML' the 3274
    rc = proc_PU2iml();
    FptrI = 0;
    while (1) {
+      ReadSig(rs232_fd);
       rc = proc_3270();
-      // Read iput from SDLC card <=======================================
-      if (SR()( > 0) {
-         if (Tdbg_flag == ON) {
-            fprintf(T_trace, "\r3274 Request Buffer (%d): ", SDLCreql);
-            for (int i=0; i < SDLCreql; i ++) {
-               fprintf(T_trace, "%02X ", SDLCreqb[i]);
-            }
-            fprintf(T_trace, "\n");
-            fflush(T_trace);
-         }  // End if debug
-      // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+      rc = ioctl(pusdlc_fd, FIONREAD, &pendingrcv);
+      if ((pendingrcv < 1) && (SocketReadAct(pusdlc_fd))) rc = -1;
+      if (rc < 0) {                                      // Retry once to account for timing delays in TCP.
+         if ((pendingrcv < 1) && (SocketReadAct(pusdlc_fd))) rc = -1;
+      }
+      if (rc < 0) {
+         printf("\rPU2: SDLC line dropped, trying to re-establish connection\n");
+         // SDLC line socket recreation
+         close(pusdlc_fd);
+         close(rs232_fd);
+         pusdlc_fd = socket(AF_INET, SOCK_STREAM, 0);
+         if (pusdlc_fd <= 0) {
+            printf("\rPU2: Cannot create line socket\n");
+            return;
+         }
+         rs232_fd = socket(AF_INET, SOCK_STREAM, 0);
+         if (rs232_fd <= 0) {
+            printf("\rPU2: Cannot create RS232 socket\n");
+            return;
+         }
+         while (connect(pusdlc_fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) != 0) {
+            sleep(1);
+         }  // End while
+         while (connect(rs232_fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) != 0) {
+            sleep(1);
+         }  // End while
+         printf("\rPU2: SDLC line connection has been re-established\n");
+      } else {
+         if (pendingrcv > 0) {
+            SDLCreql = read(pusdlc_fd, SDLCreqb, pendingrcv);
+            if (Tdbg_flag == ON) {
+               fprintf(T_trace, "\r3274 Request Buffer (%d): ", SDLCreql);
+               for (int i=0; i < SDLCreql; i ++) {
+                  fprintf(T_trace, "%02X ", SDLCreqb[i]);
+               }
+               fprintf(T_trace, "\n");
+               fflush(T_trace);
+            }  // End if debug
    //****************************************************************************************************************************
-   // Search for SDLC frames .
+   // Skip modem clocking and consecutive start flags
    //****************************************************************************************************************************
             Fptr = 0;
             if ((SDLCreqb[Fptr] == 0x00) || (SDLCreqb[Fptr] == 0xAA)) Fptr = 1;   // If modem clocking is used skip first char
-    //==>     if ((SDLCreqb[Fptr] == 0x7E) && (SDLCreqb[Fptr+1] == 0x7E) && (SDLCreqb[Fptr+2] == 0x7E)) return 0; // Consequtive 7E's. Ignore.
-            do {                       // Do till Poll bit found...
-               frame_len = 0;          //
-               // Find end of SDLC frame...
-               while (!((SDLCreqb[Fptr + frame_len + 0] == 0x47) &&
-                        (SDLCreqb[Fptr + frame_len + 1] == 0x0F) &&
-                        (SDLCreqb[Fptr + frame_len + 2] == 0x7E))) {
-                  frame_len++;
-               } // End while
-               frame_len = frame_len + 3;     // Correction length LT
-               if (Tdbg_flag == ON) {
-                  fprintf(T_trace, "\rSDLC Frame found (%d): ", frame_len);
-                  for (int i=0; i < frame_len; i ++) {
-                     fprintf(T_trace, "%02X ", SDLCreqb[Fptr+i]);
-                  }
-                  fprintf(T_trace, "\n");
-                  fflush(T_trace);
-               } // End if debug
-      //****************************************************************************************************************************
-      // Process SDLC frame
-      //****************************************************************************************************************************
-               if ((SDLCreqb[Fptr+FCntl] & 0x01) == IFRAME) {
-                  pu2[station]->seq_Nr++;                // Update receive sequence number
-                  if (pu2[station]->seq_Nr == 8) pu2[station]->seq_Nr = 0;
-                  if (Tdbg_flag == ON)
-                     fprintf(T_trace, "\r3274 LH receive sequence count=%d, Fcntl=%02X\n", pu2[station]->seq_Nr, SDLCreqb[FCntl]);
-               } //End if SDLCreqb[FCntl]
-               SDLCrspl = proc_PIU(&SDLCreqb[Fptr], frame_len, &SDLCrspb[SDLCrsptl]);
-               if (SDLCrspl > 0) {
-                  Fptr2[FptrI] = SDLCrsptl;
-                  if (Tdbg_flag == ON)
-                     fprintf(T_trace, "\r3274 Frame pointer index %d contains %d", FptrI, Fptr2[FptrI]);
-                  FptrI++;
-                  Fptr2[FptrI] = 0;
-               } // End if SDLCrspl
-               SDLCrsptl = SDLCrsptl + SDLCrspl;
-      //****************************************************************************************************************************
-      //Search for next frame
-      //****************************************************************************************************************************
-               FptrL = Fptr;               // Save pointer to last frame
-               Fptr = Fptr + frame_len;
-               if ((SDLCreqb[Fptr] == 0x00) || (SDLCreqb[Fptr] == 0xAA)) Fptr++; // If modem clocking is used skip first char
-            } // End Do
-            while (Fptr < SDLCreql);
-      //****************************************************************************************************************************
-      //Prepare and send the response
-      //****************************************************************************************************************************
-            if (Tdbg_flag == ON)
-               fprintf(T_trace, "\r3274 Total response length: %d\n", SDLCrsptl);
-            if (SDLCreqb[FptrL+FCntl] & CPoll) {               // Poll command ?
-               // Make sure the receive count is up-to-date before sending the repsonse.
-               // First get the station address and replace the receive count in the Link Header
-               FptrI = 0;
-               Fptr = Fptr2[FptrI];                                //  First frame located at offset 0.
-               do {
-                  station =  (SDLCrspb[Fptr+FAddr] & 0x0F) - 1;
-                  if ((SDLCrspb[Fptr+FCntl] & 0x03) == SUPRV) {      // Supervisory format ?
-                     SDLCrspb[Fptr+FCntl] = (SDLCrspb[Fptr+FCntl] & 0x1F) | (pu2[station]->seq_Nr << 5);  // Insert receive sequence
-                  }
-                  if  ((SDLCrspb[Fptr+FCntl] & 0x01) == IFRAME) {
-                     // Insert receive and send sequence numbers into the Frame Control byte of the response
-                     SDLCrspb[Fptr+FCntl] = (SDLCrspb[Fptr+FCntl] & 0x1F) | (pu2[station]->seq_Nr << 5);  // Insert receive sequence
-                     SDLCrspb[Fptr+FCntl] = (SDLCrspb[Fptr+FCntl] & 0xF1) | (pu2[station]->seq_Ns << 1);  // Insert send sequence
-                     pu2[station]->seq_Ns++;             // Update send sequence number
-                     if (pu2[station]->seq_Ns == 8) pu2[station]->seq_Ns = 0;
-                  }  // End if (SDLCrspb[Fptr+FCntl] & 0x01)
-                  if (Tdbg_flag == ON)
-                     fprintf(T_trace, "\r3274 LH  Receive sequence=%d, Next send Sequence=%d, Fcntl=%02X\n",
-                     pu2[station]->seq_Nr, pu2[station]->seq_Ns, SDLCrspb[Fptr+FCntl]);
-                     FptrI++;                            // Move to next Frame pointer in the array
-                     Fptr = Fptr2[FptrI];                // Get it
-                  }  // End do
-               while (Fptr != 0);                        // If the frame pointer is zero, there are no more frames
-               // Now set the final bit in the last Frame.
-               Fptr = Fptr2[FptrI-1];                    // Get the pointer to the last frame
-               SDLCrspb[Fptr+FCntl] |= CFinal;           // Set the final bit;
-               rc = send(pusdlc_fd, SDLCrspb, SDLCrsptl, 0);
-               if (Tdbg_flag == ON) {
-                  fprintf(T_trace, "\r3274 Response Buffer (%d): ", SDLCrsptl);
-                  for (int i=0; i < SDLCrsptl; i ++) {
-                     fprintf(T_trace, "%02X ", SDLCrspb[i]);
-                  }
-                  fprintf(T_trace, "\n");
-                  fflush(T_trace);
-               }  // End if debug
-               SDLCrsptl = 0;                            // Reset response total length
-               FptrI = 0;
-            } else {
+            while ((SDLCreqb[Fptr] == 0x7E) && (SDLCreqb[Fptr+1] == 0x7E) && (Fptr < SDLCreql-1)) {
+               Fptr++;
+            }
+   //****************************************************************************************************************************
+   // Search for SDLC frames .
+   //****************************************************************************************************************************
+            if (Fptr <= SDLCreql-6) {   // If there is at least one frame
+               do {                    // Do till Poll bit found...
+                  frame_len = 0;       //
+                  // Find end of SDLC frame...
+                  while (!((SDLCreqb[Fptr + frame_len + 0] == 0x47) &&
+                           (SDLCreqb[Fptr + frame_len + 1] == 0x0F) &&
+                           (SDLCreqb[Fptr + frame_len + 2] == 0x7E))) {
+                     frame_len++;
+                  } // End while
+                  frame_len = frame_len + 3;  // Correction length LT
+                  if (Tdbg_flag == ON) {
+                     fprintf(T_trace, "\rSDLC Frame found (%d): ", frame_len);
+                     for (int i=0; i < frame_len; i ++) {
+                        fprintf(T_trace, "%02X ", SDLCreqb[Fptr+i]);
+                     }
+                     fprintf(T_trace, "\n");
+                     fflush(T_trace);
+                  } // End if debug
+         //****************************************************************************************************************************
+         // Process SDLC frame
+         //****************************************************************************************************************************
+                  if ((SDLCreqb[Fptr+FCntl] & 0x01) == IFRAME) {
+                     pu2[station]->seq_Nr++;             // Update receive sequence number
+                     if (pu2[station]->seq_Nr == 8) pu2[station]->seq_Nr = 0;
+                     if (Tdbg_flag == ON)
+                        fprintf(T_trace, "\r3274 LH receive sequence count=%d, Fcntl=%02X\n", pu2[station]->seq_Nr, SDLCreqb[FCntl]);
+                  } //End if SDLCreqb[FCntl]
+                  SDLCrspl = proc_PIU(&SDLCreqb[Fptr], frame_len, &SDLCrspb[SDLCrsptl]);
+                  if (SDLCrspl > 0) {
+                     Fptr2[FptrI] = SDLCrsptl;
+                     if (Tdbg_flag == ON)
+                        fprintf(T_trace, "\r3274 Frame pointer index %d contains %d", FptrI, Fptr2[FptrI]);
+                     FptrI++;
+                     Fptr2[FptrI] = 0;
+                  } // End if SDLCrspl
+                  SDLCrsptl = SDLCrsptl + SDLCrspl;
+         //****************************************************************************************************************************
+         //Search for next frame
+         //****************************************************************************************************************************
+                  FptrL = Fptr;            // Save pointer to last frame
+                  Fptr = Fptr + frame_len;
+                  if ((SDLCreqb[Fptr] == 0x00) || (SDLCreqb[Fptr] == 0xAA)) Fptr++; // If modem clocking is used skip first char
+               } // End Do
+               while (Fptr < SDLCreql);
+         //****************************************************************************************************************************
+         //Prepare and send the response
+         //****************************************************************************************************************************
                if (Tdbg_flag == ON)
-                  fprintf(T_trace, "\r3274 No poll bit, No response required");
-            }  // End SDLCreqb[FCntl] & CPoll
+                  fprintf(T_trace, "\r3274 Total response length: %d\n", SDLCrsptl);
+               if (SDLCreqb[FptrL+FCntl] & CPoll) {            // Poll command ?
+                  // Make sure the receive count is up-to-date before sending the repsonse.
+                  // First get the station address and replace the receive count in the Link Header
+                  FptrI = 0;
+                  Fptr = Fptr2[FptrI];                             //  First frame located at offset 0.
+                  do {
+                     station = (SDLCrspb[Fptr+FAddr] & 0x0F) - 1;
+                     if ((SDLCrspb[Fptr+FCntl] & 0x03) == SUPRV) {   // Supervisory format ?
+                        SDLCrspb[Fptr+FCntl] = (SDLCrspb[Fptr+FCntl] & 0x1F) | (pu2[station]->seq_Nr << 5); // Insert receive sequence
+                     }
+                     if ((SDLCrspb[Fptr+FCntl] & 0x01) == IFRAME) {
+                        // Insert receive and send sequence numbers into the Frame Control byte of the response
+                        SDLCrspb[Fptr+FCntl] = (SDLCrspb[Fptr+FCntl] & 0x1F) | (pu2[station]->seq_Nr << 5); // Insert receive sequence
+                        SDLCrspb[Fptr+FCntl] = (SDLCrspb[Fptr+FCntl] & 0xF1) | (pu2[station]->seq_Ns << 1); // Insert send sequence
+                        pu2[station]->seq_Ns++;          // Update send sequence number
+                        if (pu2[station]->seq_Ns == 8) pu2[station]->seq_Ns = 0;
+                     } // End if (SDLCrspb[Fptr+FCntl] & 0x01)
+                     if (Tdbg_flag == ON)
+                        fprintf(T_trace, "\r3274 LH Receive sequence=%d, Next send Sequence=%d, Fcntl=%02X\n",
+                        pu2[station]->seq_Nr, pu2[station]->seq_Ns, SDLCrspb[Fptr+FCntl]);
+                        FptrI++;                         // Move to next Frame pointer in the array
+                        Fptr = Fptr2[FptrI];             // Get it
+                     } // End do
+                  while (Fptr != 0);                     // If the frame pointer is zero, there are no more frames
+                  // Now set the final bit in the last Frame.
+                  Fptr = Fptr2[FptrI-1];                 // Get the pointer to the last frame
+                  SDLCrspb[Fptr+FCntl] |= CFinal;        // Set the final bit;
+                  rc = send(pusdlc_fd, SDLCrspb, SDLCrsptl, 0);
+                  if (Tdbg_flag == ON) {
+                     fprintf(T_trace, "\r3274 Response Buffer (%d): ", SDLCrsptl);
+                     for (int i=0; i < SDLCrsptl; i ++) {
+                        fprintf(T_trace, "%02X ", SDLCrspb[i]);
+                     }
+                     fprintf(T_trace, "\n");
+                     fflush(T_trace);
+                  } // End if debug
+                  SDLCrsptl = 0;                         // Reset response total length
+                  FptrI = 0;
+               } else {
+                  if (Tdbg_flag == ON)
+                     fprintf(T_trace, "\r3274 No poll bit, No response required");
+               } // End SDLCreqb[FCntl] & CPoll
+            } // End if (Fptr < SDLCreql-6)
          }  // End if (pendingrcv > 0)
       }  // End if (rc < 0)
    }  // End while (1)
    return;
 }
 
-int SR() {
-   int rcvcnt;
-   // Selective Receive
-   out8(0x388,0xC1);
-   readp(0x388);
-   out8(0x389,0x5D);
-   readp(0x388);
-   out8(0x389,0x07);
-   readp(0x388);
-   out8(0x389,0xFF);
-   readp(0x388);
-   out8(0x389,0xC1);
-   readp(0x388);
-   out8(0x386,0x10);
-   out8(0x386,0x27);
 
-   // IRQ 3 should be presented at this point
-   WaitInt();
-   rcvcnt = 0;
-   while (in8(0x388) & 0x02) {
-      SDLCreqb[rcvcnt] = readp(0x38B);
-      rcvcnt++;
-   // IRQ 3 is on for the duration of transfer
-   }
-   return rcvcnt;
-} // End SR
+//*******************************************************************************************
+// Check if there is a signal update from the RS232 connection                              *
+// If so, receive signal data from the RS232 connection and respond if needed               *
+//*******************************************************************************************
+void ReadSig(int rs232_fd) {
+   int rc, pendingrcv;
+   uint8_t sig;
+   if (rs232_fd > 0) {                                  // If there is a connection...
+      //if (IsSocketConnected(rs232_fd)) {                // ...and if it is still alive...
+         pendingrcv = 0;
+         rc = ioctl(rs232_fd, FIONREAD, &pendingrcv);   // ...check for (signal) data in the TCP buffer
+         if (pendingrcv > 0) {                                      // If there is data...
+            //******************************************************
+            for (int i=0; i < pendingrcv; i++) {
+               rc = read(rs232_fd, &sig, 1);            // ...read it
+            }
+            //******************************************************
+            if (rc == 1) {                                          // If signal data weas received (must be 1 byte only) ....
+               if (sig & RTS) {   // If remote DCE has set RTS and CTS was not yet high....
+                  rs232_stat |= CTS;
+                  if (Tdbg_flag == ON)
+                     fprintf(T_trace, "\r3271 received RS232=%02X, return signal=%02X\n",sig, rs232_stat);
+                  // Send the current RS232 signal back.
+                  //******************************************************
+                  rc = send(rs232_fd, &rs232_stat, 1, 0);          // send current RS232 signal.
+                  //******************************************************
+               }
+            }  // End if (rc == 1)
+         }  //if (pendingrcv > 0)
+      //}  // End if IsSocketConnected
+   }  // End  if (rs232_fd > 0)
+   return;
+}
