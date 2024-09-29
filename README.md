@@ -18,7 +18,7 @@ None
 
 Scanner
 
-Scanner code rationalized: With the addition of the LIB, the differences in handling BSc and SDLC could be removed. There is now a single approach yielding performance improvements for SDLC.
+Scanner code rationalized: With the addition of the LIB, the differences in handling BSC and SDLC could be removed. There is now a single approach yielding performance improvements for SDLC.
 
 LIB
 
