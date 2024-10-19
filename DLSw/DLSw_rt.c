@@ -2,7 +2,7 @@
 
    DLSw defintions are taken from Matt Burke
    Matt Burke's DLSw testserver has been used as the starting point.
-   See Matt's website: www.track9.net/hercules/DLSw
+   See Matt's website: www.9track.net/hercules/DLSw
 
    Permission is hereby granted, free of charge, to any person obtaining a
    copy of this software and associated documentation files (the "Software"),
